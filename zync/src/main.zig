@@ -57,6 +57,15 @@ fn getColName(index: usize, buf: *[16]u8) []const u8 {
 }
 
 const CellIndex = struct { r: usize, col: usize };
+const GridRange = struct { s_row: usize, e_row: usize, s_col: usize, e_col: usize };
+const Viewport = struct {
+    win_w: f32,
+    win_h: f32,
+    view_w: f32,
+    view_h: f32,
+    full_w: f32,
+    full_h: f32,
+};
 const ZyncCell = struct {
     raw_input: std.ArrayListUnmanaged(u8) = .{},
     evaluated_display: [128]u8 = [_]u8{0} ** 128,
@@ -83,7 +92,7 @@ const ZyncSheet = struct {
 };
 
 const LruCache = struct {
-    const Node = struct { hash: u64, tex: *c.SDL_Texture, prev: ?*Node = null, next: ?*Node = null };
+    const Node = struct { hash: u64, tex: *c.SDL_Texture, tw: f32, th: f32, prev: ?*Node = null, next: ?*Node = null };
     map: std.AutoHashMap(u64, *Node),
     head: ?*Node = null,
     tail: ?*Node = null,
@@ -91,21 +100,25 @@ const LruCache = struct {
     pub fn init(allocator: std.mem.Allocator) LruCache {
         return .{ .map = std.AutoHashMap(u64, *Node).init(allocator), .allocator = allocator };
     }
-    pub fn fetch(self: *LruCache, ren: *c.SDL_Renderer, font: *c.TTF_Font, text: []const u8, color: c.SDL_Color) !*c.SDL_Texture {
-        const hash = std.hash.Wyhash.hash(color.r ^ (@as(u64, color.g) << 8), text);
+    const CachedText = struct { tex: *c.SDL_Texture, tw: f32, th: f32 };
+    pub fn fetch(self: *LruCache, ren: *c.SDL_Renderer, font: *c.TTF_Font, text: []const u8, color: c.SDL_Color) !CachedText {
+        const seed: u64 = color.r | (@as(u64, color.g) << 8) | (@as(u64, color.b) << 16) | (@as(u64, color.a) << 24);
+        const hash = std.hash.Wyhash.hash(seed, text);
         if (self.map.get(hash)) |node| {
             self.promote(node);
-            return node.tex;
+            return .{ .tex = node.tex, .tw = node.tw, .th = node.th };
         }
         if (self.map.count() >= LRU_CAPACITY) self.evict();
         const surf = c.TTF_RenderText_Blended(font, text.ptr, text.len, color) orelse return error.Ttf;
         defer c.SDL_DestroySurface(surf);
         const tex = c.SDL_CreateTextureFromSurface(ren, surf) orelse return error.Sdl;
+        const tw = @as(f32, @floatFromInt(surf.w));
+        const th = @as(f32, @floatFromInt(surf.h));
         const new_node = try self.allocator.create(Node);
-        new_node.* = .{ .hash = hash, .tex = tex };
+        new_node.* = .{ .hash = hash, .tex = tex, .tw = tw, .th = th };
         try self.map.put(hash, new_node);
         self.pushHead(new_node);
-        return tex;
+        return .{ .tex = tex, .tw = tw, .th = th };
     }
     fn pushHead(self: *LruCache, node: *Node) void {
         node.next = self.head;
@@ -131,6 +144,32 @@ const LruCache = struct {
         self.allocator.destroy(t);
     }
 };
+
+fn computeViewport(win: *c.SDL_Window) Viewport {
+    var wi: i32 = 0;
+    var hi: i32 = 0;
+    _ = c.SDL_GetWindowSize(win, &wi, &hi);
+    const win_w = @as(f32, @floatFromInt(wi));
+    const win_h = @as(f32, @floatFromInt(hi));
+    const view_w = win_w - HEADER_SIZE - SB_WIDTH;
+    const view_h = win_h - HEADER_SIZE - SB_WIDTH;
+    return .{
+        .win_w = win_w,
+        .win_h = win_h,
+        .view_w = view_w,
+        .view_h = view_h,
+        .full_w = @as(f32, TOTAL_COLS) * CELL_W,
+        .full_h = @as(f32, TOTAL_ROWS) * CELL_H,
+    };
+}
+
+fn visibleRange(off_x: f32, off_y: f32, vp: Viewport) GridRange {
+    const s_col = @as(usize, @intFromFloat(off_x / CELL_W));
+    const e_col = @min(TOTAL_COLS, s_col + @as(usize, @intFromFloat(vp.win_w / CELL_W)) + 2);
+    const s_row = @as(usize, @intFromFloat(off_y / CELL_H));
+    const e_row = @min(TOTAL_ROWS, s_row + @as(usize, @intFromFloat(vp.win_h / CELL_H)) + 2);
+    return .{ .s_row = s_row, .e_row = e_row, .s_col = s_col, .e_col = e_col };
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -158,31 +197,23 @@ pub fn main() !void {
 
     main_loop: while (true) {
         var ev: c.SDL_Event = undefined;
-        var wi: i32 = 0;
-        var hi: i32 = 0;
-        _ = c.SDL_GetWindowSize(win, &wi, &hi);
-        const win_w = @as(f32, @floatFromInt(wi));
-        const win_h = @as(f32, @floatFromInt(hi));
-        const view_w = win_w - HEADER_SIZE - SB_WIDTH;
-        const view_h = win_h - HEADER_SIZE - SB_WIDTH;
-        const full_w = @as(f32, TOTAL_COLS) * CELL_W;
-        const full_h = @as(f32, TOTAL_ROWS) * CELL_H;
+        const vp = computeViewport(win);
 
         while (c.SDL_PollEvent(&ev)) {
             switch (ev.type) {
                 c.SDL_EVENT_QUIT => break :main_loop,
                 c.SDL_EVENT_MOUSE_WHEEL => {
-                    off_y = @max(0, @min(full_h - view_h, off_y - ev.wheel.y * 75));
-                    off_x = @max(0, @min(full_w - view_w, off_x + ev.wheel.x * 75));
+                    off_y = @max(0, @min(vp.full_h - vp.view_h, off_y - ev.wheel.y * 75));
+                    off_x = @max(0, @min(vp.full_w - vp.view_w, off_x + ev.wheel.x * 75));
                 },
                 c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
                     const mx = ev.button.x;
                     const my = ev.button.y;
-                    if (mx > win_w - SB_WIDTH) {
+                    if (mx > vp.win_w - SB_WIDTH) {
                         is_drag_v = true;
                         drag_start_mouse = my;
                         drag_start_offset = off_y;
-                    } else if (my > win_h - SB_WIDTH) {
+                    } else if (my > vp.win_h - SB_WIDTH) {
                         is_drag_h = true;
                         drag_start_mouse = mx;
                         drag_start_offset = off_x;
@@ -197,8 +228,8 @@ pub fn main() !void {
                     is_drag_h = false;
                 },
                 c.SDL_EVENT_MOUSE_MOTION => {
-                    if (is_drag_v) off_y = @max(0, @min(full_h - view_h, drag_start_offset + ((ev.motion.y - drag_start_mouse) / view_h) * full_h));
-                    if (is_drag_h) off_x = @max(0, @min(full_w - view_w, drag_start_offset + ((ev.motion.x - drag_start_mouse) / view_w) * full_w));
+                    if (is_drag_v) off_y = @max(0, @min(vp.full_h - vp.view_h, drag_start_offset + ((ev.motion.y - drag_start_mouse) / vp.view_h) * vp.full_h));
+                    if (is_drag_h) off_x = @max(0, @min(vp.full_w - vp.view_w, drag_start_offset + ((ev.motion.x - drag_start_mouse) / vp.view_w) * vp.full_w));
                 },
                 c.SDL_EVENT_TEXT_INPUT => {
                     const cell = try sheet.getOrCreate(sel_r, sel_c);
@@ -255,14 +286,11 @@ pub fn main() !void {
         _ = c.SDL_SetRenderDrawColor(ren, CT_BASE.r, CT_BASE.g, CT_BASE.b, 255);
         _ = c.SDL_RenderClear(ren);
 
-        const s_col = @as(usize, @intFromFloat(off_x / CELL_W));
-        const e_col = @min(TOTAL_COLS, s_col + @as(usize, @intFromFloat(win_w / CELL_W)) + 2);
-        const s_row = @as(usize, @intFromFloat(off_y / CELL_H));
-        const e_row = @min(TOTAL_ROWS, s_row + @as(usize, @intFromFloat(win_h / CELL_H)) + 2);
+        const range = visibleRange(off_x, off_y, vp);
 
         // 1. 일반 셀 렌더링
-        for (s_row..e_row) |r| {
-            for (s_col..e_col) |col| {
+        for (range.s_row..range.e_row) |r| {
+            for (range.s_col..range.e_col) |col| {
                 const x = @as(f32, @floatFromInt(col)) * CELL_W - off_x + HEADER_SIZE;
                 const y = @as(f32, @floatFromInt(r)) * CELL_H - off_y + HEADER_SIZE;
 
@@ -277,11 +305,8 @@ pub fn main() !void {
                             const safe_txt = getSafeWidthText(font, full_txt, CELL_W - 12);
 
                             if (safe_txt.len > 0) {
-                                const tex = try lru.fetch(ren, font, safe_txt, CT_TEXT);
-                                var tw: f32 = 0;
-                                var th: f32 = 0;
-                                _ = c.SDL_GetTextureSize(tex, &tw, &th);
-                                _ = c.SDL_RenderTexture(ren, tex, null, &c.SDL_FRect{ .x = x + 6, .y = y + (CELL_H - th) / 2, .w = tw, .h = th });
+                                const cached = try lru.fetch(ren, font, safe_txt, CT_TEXT);
+                                _ = c.SDL_RenderTexture(ren, cached.tex, null, &c.SDL_FRect{ .x = x + 6, .y = y + (CELL_H - cached.th) / 2, .w = cached.tw, .h = cached.th });
                             }
                         }
                     }
@@ -290,7 +315,7 @@ pub fn main() !void {
         }
 
         // 2. 선택된 셀 (오버플로우)
-        _ = c.SDL_SetRenderClipRect(ren, &c.SDL_Rect{ .x = @intFromFloat(HEADER_SIZE), .y = @intFromFloat(HEADER_SIZE), .w = @intFromFloat(view_w), .h = @intFromFloat(view_h) });
+        _ = c.SDL_SetRenderClipRect(ren, &c.SDL_Rect{ .x = @intFromFloat(HEADER_SIZE), .y = @intFromFloat(HEADER_SIZE), .w = @intFromFloat(vp.view_w), .h = @intFromFloat(vp.view_h) });
         {
             const x = @as(f32, @floatFromInt(sel_c)) * CELL_W - off_x + HEADER_SIZE;
             const y = @as(f32, @floatFromInt(sel_r)) * CELL_H - off_y + HEADER_SIZE;
@@ -300,13 +325,10 @@ pub fn main() !void {
             const txt = std.fmt.bufPrint(&buf, "{s}{s}", .{ base, comp_text[0..comp_len] }) catch "";
 
             if (txt.len > 0) {
-                const tex = try lru.fetch(ren, font, txt, CT_TEXT);
-                var tw: f32 = 0;
-                var th: f32 = 0;
-                _ = c.SDL_GetTextureSize(tex, &tw, &th);
+                const cached = try lru.fetch(ren, font, txt, CT_TEXT);
                 _ = c.SDL_SetRenderDrawColor(ren, CT_BASE.r, CT_BASE.g, CT_BASE.b, 255);
-                _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = x + 1, .y = y + 1, .w = @max(CELL_W - 2, tw + 10), .h = CELL_H - 2 });
-                _ = c.SDL_RenderTexture(ren, tex, null, &c.SDL_FRect{ .x = x + 6, .y = y + (CELL_H - th) / 2, .w = tw, .h = th });
+                _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = x + 1, .y = y + 1, .w = @max(CELL_W - 2, cached.tw + 10), .h = CELL_H - 2 });
+                _ = c.SDL_RenderTexture(ren, cached.tex, null, &c.SDL_FRect{ .x = x + 6, .y = y + (CELL_H - cached.th) / 2, .w = cached.tw, .h = cached.th });
             }
             _ = c.SDL_SetRenderDrawColor(ren, CT_LAVENDER.r, CT_LAVENDER.g, CT_LAVENDER.b, 255);
             _ = c.SDL_RenderRect(ren, &c.SDL_FRect{ .x = x - 1, .y = y - 1, .w = CELL_W + 2, .h = CELL_H + 2 });
@@ -314,7 +336,7 @@ pub fn main() !void {
         _ = c.SDL_SetRenderClipRect(ren, null);
 
         // 3. 헤더
-        for (s_col..e_col) |col| {
+        for (range.s_col..range.e_col) |col| {
             const x = @as(f32, @floatFromInt(col)) * CELL_W - off_x + HEADER_SIZE;
             if (x < HEADER_SIZE - 1) continue;
             _ = c.SDL_SetRenderDrawColor(ren, CT_MANTLE.r, CT_MANTLE.g, CT_MANTLE.b, 255);
@@ -322,13 +344,10 @@ pub fn main() !void {
             _ = c.SDL_SetRenderDrawColor(ren, CT_SURFACE0.r, CT_SURFACE0.g, CT_SURFACE0.b, 255);
             _ = c.SDL_RenderRect(ren, &c.SDL_FRect{ .x = x, .y = 0, .w = CELL_W, .h = HEADER_SIZE });
             var c_buf: [16]u8 = undefined;
-            const tex = try lru.fetch(ren, font, getColName(col, &c_buf), if (col == sel_c) CT_GREEN else CT_SUBTEXT0);
-            var tw: f32 = 0;
-            var th: f32 = 0;
-            _ = c.SDL_GetTextureSize(tex, &tw, &th);
-            _ = c.SDL_RenderTexture(ren, tex, null, &c.SDL_FRect{ .x = x + (CELL_W - tw) / 2, .y = (HEADER_SIZE - th) / 2, .w = tw, .h = th });
+            const cached = try lru.fetch(ren, font, getColName(col, &c_buf), if (col == sel_c) CT_GREEN else CT_SUBTEXT0);
+            _ = c.SDL_RenderTexture(ren, cached.tex, null, &c.SDL_FRect{ .x = x + (CELL_W - cached.tw) / 2, .y = (HEADER_SIZE - cached.th) / 2, .w = cached.tw, .h = cached.th });
         }
-        for (s_row..e_row) |r| {
+        for (range.s_row..range.e_row) |r| {
             const y = @as(f32, @floatFromInt(r)) * CELL_H - off_y + HEADER_SIZE;
             if (y < HEADER_SIZE - 1) continue;
             _ = c.SDL_SetRenderDrawColor(ren, CT_MANTLE.r, CT_MANTLE.g, CT_MANTLE.b, 255);
@@ -337,26 +356,23 @@ pub fn main() !void {
             _ = c.SDL_RenderRect(ren, &c.SDL_FRect{ .x = 0, .y = y, .w = HEADER_SIZE, .h = CELL_H });
             var r_buf: [16]u8 = undefined;
             const s = std.fmt.bufPrint(&r_buf, "{d}", .{r + 1}) catch "";
-            const tex = try lru.fetch(ren, font, s, if (r == sel_r) CT_GREEN else CT_SUBTEXT0);
-            var tw: f32 = 0;
-            var th: f32 = 0;
-            _ = c.SDL_GetTextureSize(tex, &tw, &th);
-            _ = c.SDL_RenderTexture(ren, tex, null, &c.SDL_FRect{ .x = (HEADER_SIZE - tw) / 2, .y = y + (CELL_H - th) / 2, .w = tw, .h = th });
+            const cached = try lru.fetch(ren, font, s, if (r == sel_r) CT_GREEN else CT_SUBTEXT0);
+            _ = c.SDL_RenderTexture(ren, cached.tex, null, &c.SDL_FRect{ .x = (HEADER_SIZE - cached.tw) / 2, .y = y + (CELL_H - cached.th) / 2, .w = cached.tw, .h = cached.th });
         }
         _ = c.SDL_SetRenderDrawColor(ren, CT_MANTLE.r, CT_MANTLE.g, CT_MANTLE.b, 255);
         _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = 0, .y = 0, .w = HEADER_SIZE, .h = HEADER_SIZE });
 
         // 4. 스크롤바
         _ = c.SDL_SetRenderDrawColor(ren, CT_MANTLE.r, CT_MANTLE.g, CT_MANTLE.b, 255);
-        _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = win_w - SB_WIDTH, .y = 0, .w = SB_WIDTH, .h = win_h });
-        _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = 0, .y = win_h - SB_WIDTH, .w = win_w, .h = SB_WIDTH });
-        const v_h = @max(30, (view_h / full_h) * view_h);
-        const v_y = HEADER_SIZE + (off_y / (full_h - view_h)) * (view_h - v_h);
-        const h_w = @max(30, (view_w / full_w) * view_w);
-        const h_x = HEADER_SIZE + (off_x / (full_w - view_w)) * (view_w - h_w);
+        _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = vp.win_w - SB_WIDTH, .y = 0, .w = SB_WIDTH, .h = vp.win_h });
+        _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = 0, .y = vp.win_h - SB_WIDTH, .w = vp.win_w, .h = SB_WIDTH });
+        const v_h = @max(30, (vp.view_h / vp.full_h) * vp.view_h);
+        const v_y = HEADER_SIZE + (off_y / (vp.full_h - vp.view_h)) * (vp.view_h - v_h);
+        const h_w = @max(30, (vp.view_w / vp.full_w) * vp.view_w);
+        const h_x = HEADER_SIZE + (off_x / (vp.full_w - vp.view_w)) * (vp.view_w - h_w);
         _ = c.SDL_SetRenderDrawColor(ren, CT_SURFACE0.r, CT_SURFACE0.g, CT_SURFACE0.b, 255);
-        _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = win_w - SB_WIDTH + 2, .y = v_y, .w = SB_WIDTH - 4, .h = v_h });
-        _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = h_x, .y = win_h - SB_WIDTH + 2, .w = h_w, .h = SB_WIDTH - 4 });
+        _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = vp.win_w - SB_WIDTH + 2, .y = v_y, .w = SB_WIDTH - 4, .h = v_h });
+        _ = c.SDL_RenderFillRect(ren, &c.SDL_FRect{ .x = h_x, .y = vp.win_h - SB_WIDTH + 2, .w = h_w, .h = SB_WIDTH - 4 });
 
         _ = c.SDL_RenderPresent(ren);
     }
